@@ -54,6 +54,9 @@ pub enum SymphoniaDecoderError {
     #[error("The audio source's duration is either unknown or infinite")]
     /// Error raised when the audio source's duration is either unknown or infinite.
     IndeterminantDuration,
+    #[error("There was an error in the pipeline: {0}")]
+    /// Error raised when there is an error in the pipeline.
+    PipelineError(String),
 }
 
 impl From<rubato::ResampleError> for SymphoniaDecoderError {
@@ -74,6 +77,11 @@ impl From<std::io::Error> for SymphoniaDecoderError {
 impl From<Error> for SymphoniaDecoderError {
     fn from(err: Error) -> Self {
         Self::DecodeError(err.to_string())
+    }
+}
+impl From<PipelineError> for SymphoniaDecoderError {
+    fn from(err: PipelineError) -> Self {
+        Self::PipelineError(err.to_string())
     }
 }
 impl From<SymphoniaDecoderError> for BlissError {
@@ -743,6 +751,743 @@ mod tests {
             b.iter(|| {
                 Decoder::decode(&path).unwrap();
             });
+        }
+    }
+}
+
+pub use pipelined_decoder::{PipelineError, PipelinedSymphoniaDecoder};
+
+mod pipelined_decoder {
+    use std::{
+        f32::consts::SQRT_2,
+        fs::File,
+        num::NonZeroUsize,
+        sync::mpsc::{self, Receiver, Sender},
+        thread,
+    };
+
+    use rubato::{FastFixedIn, Resampler};
+    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+    use thiserror::Error;
+
+    use crate::{BlissResult, SAMPLE_RATE};
+
+    use super::{Decoder, PreAnalyzedSong, SymphoniaDecoderError, SymphoniaSource, CHUNK_SIZE};
+
+    #[derive(Error, Debug)]
+    /// Error that can occur in the pipelined decoder, this let's us give information about which part of the pipeline failed
+    pub enum PipelineError {
+        #[error("An error occurred in the downmixer: {0}")]
+        /// an error occurred in the downmixer, this can only really be from sending on a closed channel
+        Downmixer(String),
+        #[error("An error occurred in the resampler: {0}")]
+        /// an error occurred in the resampler
+        Resampler(String),
+        #[error("An error occurred in the collector: {0}")]
+        /// an error occurred in the collector
+        Collector(String),
+    }
+
+    impl PipelineError {
+        // give mutable access to the inner string so we can add some context to the error
+        fn add_context(&mut self, context: &str) {
+            match self {
+                Self::Downmixer(s) | Self::Resampler(s) | Self::Collector(s) => {
+                    s.push_str(context);
+                }
+            }
+        }
+    }
+
+    // enums for the messages the threads will send out
+    /// Messages emitted by the downmixer
+    enum DownmixerMessage {
+        /// a complete list of `CHUNK_SIZE` mono samples
+        MonoChunk(Vec<f32>),
+        /// notify the resampler that the downmixer has finished,
+        /// also include any remaining samples that weren't enough to fill a chunk (if any)
+        End(Option<Vec<f32>>),
+        /// notify the collector that there was an error in the downmixer
+        Error(PipelineError),
+    }
+    /// Messages emitted by the resampler
+    enum ResamplerMessage {
+        /// a resampled chunk of audio frames, and the index of the chunk (for reconstruction)
+        ResampledChunk(usize, Vec<f32>),
+        /// notify the collector that the resampler has finished, when that happens we report some infomation that the collector will need
+        End { delay: usize, new_length: usize },
+        /// notify the collector that there was an error in the resampler
+        Error(PipelineError),
+    }
+
+    /// A pipelined decoder based on Symphonia
+    pub struct PipelinedSymphoniaDecoder;
+
+    impl PipelinedSymphoniaDecoder {
+        fn downmixer(
+            downmixed_to_resampler: mpsc::Sender<DownmixerMessage>,
+            mut source: impl Iterator<Item = f32>,
+            num_channels: NonZeroUsize,
+        ) -> Result<(), PipelineError> {
+            let mut downmixed = Vec::with_capacity(CHUNK_SIZE);
+
+            match num_channels.get() {
+                0 => unreachable!(),
+                // already mono:
+                1 => {
+                    // if it's mono, we can just pass it through
+                    for sample in source {
+                        downmixed.push(sample);
+                        if downmixed.len() == CHUNK_SIZE {
+                            downmixed_to_resampler
+                                .send(DownmixerMessage::MonoChunk(downmixed.clone()))
+                                .map_err(|e| PipelineError::Downmixer(e.to_string()))?;
+                            downmixed.clear();
+                        }
+                    }
+                }
+                // stereo
+                2 => {
+                    // if it's stereo, we need to average the channels and multiply by the square root of 2
+                    while let (Some(left), right) =
+                        (source.next(), source.next().unwrap_or_default())
+                    {
+                        downmixed.push((left + right) * SQRT_2 / 2.);
+                        if downmixed.len() == CHUNK_SIZE {
+                            downmixed_to_resampler
+                                .send(DownmixerMessage::MonoChunk(downmixed.clone()))
+                                .map_err(|e| PipelineError::Downmixer(e.to_string()))?;
+                            downmixed.clear();
+                        }
+                    }
+                }
+                num_channels => {
+                    // otherwise, we will just average the channels
+                    log::warn!("The audio source has more than 2 channels ({num_channels}), will collapse to mono by averaging the channels");
+
+                    let mut source = source.peekable();
+                    while source.peek().is_some() {
+                        let sum = source.by_ref().take(num_channels).sum::<f32>();
+                        downmixed.push(sum / num_channels as f32);
+                        if downmixed.len() == CHUNK_SIZE {
+                            downmixed_to_resampler
+                                .send(DownmixerMessage::MonoChunk(downmixed.clone()))
+                                .map_err(|e| PipelineError::Downmixer(e.to_string()))?;
+                            downmixed.clear();
+                        }
+                    }
+                }
+            }
+
+            if !downmixed.is_empty() {
+                downmixed_to_resampler
+                    .send(DownmixerMessage::End(Some(downmixed)))
+                    .map_err(|e| PipelineError::Downmixer(e.to_string()))?;
+            } else {
+                downmixed_to_resampler
+                    .send(DownmixerMessage::End(None))
+                    .map_err(|e| PipelineError::Downmixer(e.to_string()))?;
+            };
+
+            Ok(())
+        }
+
+        fn resampler(
+            downmixed_rx: mpsc::Receiver<DownmixerMessage>,
+            resampled_to_collector: mpsc::Sender<ResamplerMessage>,
+            resampler: &mut FastFixedIn<f32>,
+            sample_rate: u32,
+        ) -> Result<(), PipelineError> {
+            // if we don't need to resample, just pass the chunks through
+            if sample_rate == SAMPLE_RATE {
+                return resampler_pass_through(downmixed_rx, resampled_to_collector);
+            }
+
+            // otherwise, we need to resample the chunks to 22050 Hz
+            let mut frames_processed = 0;
+            let mut frames_sent = 0;
+            let delay = resampler.output_delay();
+            let mut output_buffer = resampler.output_buffer_allocate(true);
+
+            // used as an id for the chunks, so we can reconstruct the song in the correct order
+            let mut message_id = 0;
+
+            for message in downmixed_rx {
+                let output_written = match message {
+                    // if we get a chunk, we need to resample it
+                    DownmixerMessage::MonoChunk(items) => {
+                        debug_assert_eq!(items.len(), CHUNK_SIZE);
+                        frames_processed += CHUNK_SIZE;
+
+                        let (_, output_written) = resampler
+                            .process_into_buffer(&[&items], output_buffer.as_mut_slice(), None)
+                            .map_err(|e| {
+                                PipelineError::Resampler(SymphoniaDecoderError::from(e).to_string())
+                            })?;
+                        output_written
+                    }
+                    // if we get an end message, we need to flush the resampler
+                    DownmixerMessage::End(Some(items)) => {
+                        frames_processed += items.len();
+                        let (_, output_written) = resampler
+                            .process_partial_into_buffer(
+                                Some(&[&items]),
+                                output_buffer.as_mut_slice(),
+                                None,
+                            )
+                            .map_err(|e| {
+                                PipelineError::Resampler(SymphoniaDecoderError::from(e).to_string())
+                            })?;
+                        output_written
+                    }
+                    DownmixerMessage::End(None) => {
+                        break;
+                    }
+                    DownmixerMessage::Error(pipeline_error) => {
+                        return Err(pipeline_error);
+                    }
+                };
+                frames_sent += output_written;
+                resampled_to_collector
+                    .send(ResamplerMessage::ResampledChunk(
+                        message_id,
+                        output_buffer[0][..output_written].to_vec(),
+                    ))
+                    .map_err(|e| PipelineError::Resampler(e.to_string()))?;
+                message_id += 1;
+            }
+
+            let new_length = frames_processed * SAMPLE_RATE as usize / sample_rate as usize;
+
+            // flush the resampler, if needed
+            if frames_sent < new_length + delay {
+                let (_, output_written) = resampler
+                    .process_partial_into_buffer(
+                        Option::<&[&[f32]]>::None,
+                        output_buffer.as_mut_slice(),
+                        None,
+                    )
+                    .map_err(|e| {
+                        PipelineError::Resampler(SymphoniaDecoderError::from(e).to_string())
+                    })?;
+                resampled_to_collector
+                    .send(ResamplerMessage::ResampledChunk(
+                        message_id,
+                        output_buffer[0][..output_written].to_vec(),
+                    ))
+                    .map_err(|e| PipelineError::Resampler(e.to_string()))?;
+            }
+
+            resampled_to_collector
+                .send(ResamplerMessage::End { delay, new_length })
+                .map_err(|e| PipelineError::Resampler(e.to_string()))?;
+
+            Ok(())
+        }
+    }
+
+    /// convenience function for the resampler, just passes the chunks through
+    fn resampler_pass_through(
+        downmixed_rx: Receiver<DownmixerMessage>,
+        resampled_to_collector: Sender<ResamplerMessage>,
+    ) -> Result<(), PipelineError> {
+        let mut frames_processed = 0;
+
+        for (i, message) in downmixed_rx.iter().enumerate() {
+            match message {
+                DownmixerMessage::MonoChunk(chunk) => {
+                    frames_processed += chunk.len();
+                    resampled_to_collector
+                        .send(ResamplerMessage::ResampledChunk(i, chunk))
+                        .map_err(|e| PipelineError::Resampler(e.to_string()))?;
+                }
+                DownmixerMessage::End(remainder) => {
+                    if let Some(remainder) = remainder {
+                        frames_processed += remainder.len();
+                        resampled_to_collector
+                            .send(ResamplerMessage::ResampledChunk(i, remainder))
+                            .map_err(|e| PipelineError::Resampler(e.to_string()))?;
+                    }
+
+                    resampled_to_collector
+                        .send(ResamplerMessage::End {
+                            delay: 0,
+                            new_length: frames_processed,
+                        })
+                        .map_err(|e| PipelineError::Resampler(e.to_string()))?;
+                }
+                DownmixerMessage::Error(e) => {
+                    // following convention, we will just return this error and let the caller handle passing it on
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    impl Decoder for PipelinedSymphoniaDecoder {
+        fn decode(path: &std::path::Path) -> BlissResult<PreAnalyzedSong> {
+            // create the source (audio decoder)
+            let file = File::open(path).map_err(SymphoniaDecoderError::from)?;
+            let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+            let source = SymphoniaSource::new(mss)?;
+
+            // collect some information about the audio that we'll need later
+            let sample_rate = source.spec.rate;
+            let num_channels = source.spec.channels.count();
+
+            // handle some invariants so we don't need to worry about them in the pipeline
+            if num_channels == 0 {
+                return Err(SymphoniaDecoderError::NoStreams.into());
+            }
+            let Some(total_duration) = source.total_duration else {
+                return Err(SymphoniaDecoderError::IndeterminantDuration.into());
+            };
+
+            // if the audio is already at the correct sample rate and number of channels, we should defer to the non-pipelined decoder
+            if num_channels == 1 && sample_rate == SAMPLE_RATE {
+                return super::SymphoniaDecoder::decode(path);
+            }
+
+            // we've already checked that num_channels isn't 0, so let's encode that knowledge into the type system
+            let num_channels = NonZeroUsize::new(num_channels).unwrap();
+
+            // allocate a vector that we will fill with the resampled audio
+            let mut resampled_audio_chunks = Vec::with_capacity(
+                // approximate the number of chunks we will need
+                (total_duration.as_secs() as usize + 1) * SAMPLE_RATE as usize / CHUNK_SIZE,
+            );
+
+            // info from the collector that we need to know which samples to keep
+            let mut delay = 0;
+            let mut length = None;
+
+            // create the FastFixedIn resampler
+            let mut resampler = FastFixedIn::new(
+                sample_rate as f64 / SAMPLE_RATE as f64,
+                1.,
+                rubato::PolynomialDegree::Linear,
+                CHUNK_SIZE,
+                1,
+            )
+            .map_err(SymphoniaDecoderError::from)?;
+
+            // create the channels that our threads will use to communicate
+            // TODO: refactor this to use bounded channels
+            let (downmixed_to_resampler, downmixed_rx) = mpsc::channel();
+            let (resampled_to_collector, collector_rx) = mpsc::channel();
+
+            // start a thread scope so that we can guarantee the threads we spawn will be joined at the end of the scope
+            thread::scope(|s| {
+                // set up the threads in the pipeline
+                // The first thread will be fed frames by the source, downmix them to mono, and emit them in chunks of CHUNK_SIZE
+                // for simplicity, we'll just move the source to this thread and let it consume frames directly,
+                // but if we wanted to, we could use another thread to feed frames to this thread in batches of `num_channels * CHUNK_SIZE`,
+                // which might have some advantages, unsure.
+                s.spawn(|| {
+                    if let Err(e) =
+                        Self::downmixer(downmixed_to_resampler.clone(), source, num_channels)
+                    {
+                        // TODO: there's no good way to handle the possibility of this sent failing,
+                        // for now, we'll just ignore it, but this deserves being revisited
+                        let _ = downmixed_to_resampler.send(DownmixerMessage::Error(e));
+                    }
+                    drop(downmixed_to_resampler);
+                });
+
+                // The second thread will take those chunks of mono samples, resample them to 22050 Hz, and emit the resampled chunks as they come
+                s.spawn(move || {
+                    if let Err(e) = Self::resampler(
+                        downmixed_rx,
+                        resampled_to_collector.clone(),
+                        &mut resampler,
+                        sample_rate,
+                    ) {
+                        // TODO: there's no good way to handle the possibility of this sent failing,
+                        // for now, we'll just ignore it, but this deserves being revisited
+                        let _ = resampled_to_collector.send(ResamplerMessage::Error(e));
+                    }
+                });
+
+                // Finally, the main thread can collect the resampled chunks into the final sample array
+                for message in collector_rx {
+                    match message {
+                        ResamplerMessage::ResampledChunk(id, chunk) => {
+                            resampled_audio_chunks.push((id, chunk));
+                        }
+                        ResamplerMessage::End {
+                            delay: delay_from_resampler,
+                            new_length,
+                        } => {
+                            delay = delay_from_resampler;
+                            length = Some(new_length);
+
+                            break;
+                        }
+                        ResamplerMessage::Error(mut e) => {
+                            let context = format!(" (file: {})", path.display());
+                            e.add_context(&context);
+                            return Err(SymphoniaDecoderError::PipelineError(e.to_string()));
+                        }
+                    }
+                }
+
+                Ok(())
+            })?;
+
+            resampled_audio_chunks.sort_by_key(|(id, _)| *id);
+
+            if let Some(new_length) = length {
+                let mut sample_array: Vec<f32> = resampled_audio_chunks
+                    .into_iter()
+                    .flat_map(|(_, chunk)| chunk)
+                    .skip(delay)
+                    .take(new_length)
+                    .collect();
+                sample_array.shrink_to_fit();
+                Ok(PreAnalyzedSong {
+                    path: path.to_owned(),
+                    sample_array,
+                    ..Default::default()
+                })
+            } else {
+                // TODO: maybe we should just fail in this case
+                log::error!("Collector never received an End message from the resampler, returning current buffer");
+                let mut sample_array: Vec<f32> = resampled_audio_chunks
+                    .into_iter()
+                    .flat_map(|(_, chunk)| chunk)
+                    // .skip(delay)
+                    .collect();
+                sample_array.shrink_to_fit();
+                Ok(PreAnalyzedSong {
+                    path: path.to_owned(),
+                    sample_array,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Decoder as DecoderTrait, PipelinedSymphoniaDecoder as Decoder};
+        use adler32::RollingAdler32;
+        use pretty_assertions::assert_eq;
+        use std::path::Path;
+
+        fn _test_decode(path: &Path, expected_hash: u32) {
+            let song = Decoder::decode(path).unwrap();
+            let mut hasher = RollingAdler32::new();
+            for sample in &song.sample_array {
+                hasher.update_buffer(&sample.to_le_bytes());
+            }
+
+            assert_eq!(expected_hash, hasher.hash());
+        }
+
+        // expected hashs Obtained through
+        // ffmpeg -i data/s16_stereo_22_5kHz.flac -ar 22050 -ac 1 -c:a pcm_f32le -f hash -hash adler32 -
+
+        #[cfg(feature = "symphonia-wav")]
+        #[test]
+        fn test_decode_wav() {
+            let expected_hash = 0xde831e82;
+            _test_decode(Path::new("data/piano.wav"), expected_hash);
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        #[ignore = "fails when asked to resample to 22050 Hz, ig ffmpeg does it differently, but I'm not sure what the difference actually is"]
+        fn test_resample_mono() {
+            let path = Path::new("data/s32_mono_44_1_kHz.flac");
+            let expected_hash = 0xa0f8b8af;
+            _test_decode(&path, expected_hash);
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        fn test_resample_mono_ffmpeg_v_symphonia() {
+            let path = Path::new("data/s32_mono_44_1_kHz.flac");
+            let symphonia_decoded = Decoder::decode(&path).unwrap();
+            let ffmpeg_decoded = crate::decoder::ffmpeg::FFmpeg::decode(&path).unwrap();
+            // if the first 100 samples are equal, then the rest should be equal.
+            // we check this first since the sample arrays are large enough that printing the diff would attempt
+            // and fail to allocate memory for the string
+            // assert_eq!(
+            //     symphonia_decoded.sample_array[..100],
+            //     ffmpeg_decoded.sample_array[..100]
+            // );
+            // assert_eq!(symphonia_decoded.sample_array, ffmpeg_decoded.sample_array);
+
+            // calculate the similarity between the two arrays
+            let mut diff = 0.0;
+            for (a, b) in symphonia_decoded
+                .sample_array
+                .iter()
+                .zip(ffmpeg_decoded.sample_array.iter())
+            {
+                diff += (a - b).abs();
+            }
+            diff /= symphonia_decoded.sample_array.len() as f32;
+            assert!(
+                diff < 1.0e-5,
+                "Difference between symphonia and ffmpeg: {}",
+                diff
+            );
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        #[ignore = "fails when asked to resample to 22050 Hz, ig ffmpeg does it differently, but I'm not sure what the difference actually is"]
+        fn test_resample_multi() {
+            let path = Path::new("data/s32_stereo_44_1_kHz.flac");
+            let expected_hash = 0xbbcba1cf;
+            _test_decode(&path, expected_hash);
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        fn test_resample_multi_ffmpeg_v_symphonia() {
+            let path = Path::new("data/s32_stereo_44_1_kHz.flac");
+            let symphonia_decoded = Decoder::decode(&path).unwrap();
+            let ffmpeg_decoded = crate::decoder::ffmpeg::FFmpeg::decode(&path).unwrap();
+
+            // calculate the similarity between the two arrays
+            let mut diff = 0.0;
+            for (a, b) in symphonia_decoded
+                .sample_array
+                .iter()
+                .zip(ffmpeg_decoded.sample_array.iter())
+            {
+                diff += (a - b).abs();
+            }
+            diff /= symphonia_decoded.sample_array.len() as f32;
+            assert!(
+                diff < 1.0e-5,
+                "Difference between symphonia and ffmpeg: {}",
+                diff
+            );
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        fn test_resample_stereo() {
+            let path = Path::new("data/s16_stereo_22_5kHz.flac");
+            let expected_hash = 0x1d7b2d6d;
+            _test_decode(&path, expected_hash);
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        // From this test, I was able to determine that multiplying the average of the channels by the square root of 2
+        // recovers the exact behavior of ffmpeg when converting stereo to mono
+        fn test_stereo_ffmpeg_v_symphonia() {
+            let path = Path::new("data/s16_stereo_22_5kHz.flac");
+            let symphonia_decoded = Decoder::decode(&path).unwrap();
+            let ffmpeg_decoded = crate::decoder::ffmpeg::FFmpeg::decode(&path).unwrap();
+            // if the first 100 samples are equal, then the rest should be equal.
+            // we check this first since the sample arrays are large enough that printing the diff would attempt
+            // and fail to allocate memory for the string
+            assert_eq!(
+                symphonia_decoded.sample_array[..100],
+                ffmpeg_decoded.sample_array[..100]
+            );
+            assert_eq!(symphonia_decoded.sample_array, ffmpeg_decoded.sample_array);
+        }
+
+        #[cfg(feature = "symphonia-flac")]
+        #[test]
+        fn test_decode_mono() {
+            let path = Path::new("data/s16_mono_22_5kHz.flac");
+            // Obtained through
+            // ffmpeg -i data/s16_mono_22_5kHz.flac -ar 22050 -ac 1 -c:a pcm_f32le
+            // -f hash -hash adler32 -
+            let expected_hash = 0x5e01930b;
+            _test_decode(&path, expected_hash);
+        }
+
+        #[cfg(feature = "symphonia-mp3")]
+        #[test]
+        #[ignore = "fails when asked to convert stereo to mono, ig ffmpeg does it differently, but I'm not sure what the difference actually is"]
+        fn test_decode_mp3() {
+            let path = Path::new("data/s32_stereo_44_1_kHz.mp3");
+            // Obtained through
+            // ffmpeg -i data/s16_mono_22_5kHz.mp3 -ar 22050 -ac 1 -c:a pcm_f32le
+            // -f hash -hash adler32 -
+            //1030601839
+            let expected_hash = 0x69ca6906;
+            _test_decode(&path, expected_hash);
+        }
+
+        #[cfg(feature = "symphonia-mp3")]
+        #[test]
+        fn test_decode_mp3_ffmpeg_v_symphonia() {
+            // TODO: Figure out how to get the error down to 1.0e-5
+            let path = Path::new("data/s32_stereo_44_1_kHz.mp3");
+            let symphonia_decoded = Decoder::decode(&path).unwrap();
+            let ffmpeg_decoded = crate::decoder::ffmpeg::FFmpeg::decode(&path).unwrap();
+
+            // calculate the similarity between the two arrays
+            let mut diff = 0.0;
+            for (a, b) in symphonia_decoded
+                .sample_array
+                .iter()
+                .zip(ffmpeg_decoded.sample_array.iter())
+            {
+                diff += (a - b).abs();
+            }
+            diff /= symphonia_decoded.sample_array.len() as f32;
+            assert!(
+                diff < 0.05,
+                "Difference between symphonia and ffmpeg: {}",
+                diff
+            );
+        }
+
+        #[cfg(feature = "symphonia-wav")]
+        #[test]
+        fn test_dont_panic_no_channel_layout() {
+            let path = Path::new("data/no_channel.wav");
+            Decoder::decode(path).unwrap();
+        }
+
+        #[cfg(all(feature = "symphonia-flac", feature = "symphonia-ogg"))]
+        #[test]
+        fn test_decode_right_capacity_vec() {
+            let path = Path::new("data/s16_mono_22_5kHz.flac");
+            let song = Decoder::decode(path).unwrap();
+            let sample_array = song.sample_array;
+            assert_eq!(
+                sample_array.len(), // + SAMPLE_RATE as usize, // The + SAMPLE_RATE is because bliss-rs would add an extra second as a buffer, we don't need to because we know the exact length of the song
+                sample_array.capacity()
+            );
+
+            let path = Path::new("data/s32_stereo_44_1_kHz.flac");
+            let song = Decoder::decode(path).unwrap();
+            let sample_array = song.sample_array;
+            assert_eq!(
+                sample_array.len(), // + SAMPLE_RATE as usize,
+                sample_array.capacity()
+            );
+
+            let path = Path::new("data/capacity_fix.ogg");
+            let song = Decoder::decode(path).unwrap();
+            let sample_array = song.sample_array;
+            assert_eq!(
+                sample_array.len(), // + SAMPLE_RATE as usize,
+                sample_array.capacity()
+            );
+        }
+
+        #[cfg(all(
+            feature = "symphonia-flac",
+            feature = "symphonia-ogg",
+            feature = "symphonia-wav",
+            feature = "symphonia-mp3"
+        ))]
+        #[test]
+        fn compare_ffmpeg_to_symphonia_for_all_test_songs() {
+            let paths_and_tolerances = [
+                ("data/capacity_fix.ogg", 0.0000000017),
+                ("data/no_channel.wav", 0.027),
+                ("data/no_tags.flac", 0.175),
+                ("data/piano.flac", f32::EPSILON),
+                ("data/piano.wav", f32::EPSILON),
+                ("data/s16_mono_22_5kHz.flac", f32::EPSILON),
+                ("data/s16_stereo_22_5kHz.flac", f32::EPSILON),
+                ("data/s32_mono_44_1_kHz.flac", 0.0000069),
+                ("data/s32_stereo_44_1_kHz.flac", 0.00001),
+                ("data/s32_stereo_44_1_kHz.mp3", 0.03),
+                ("data/special-tags.mp3", 0.312),
+                ("data/tone_11080Hz.flac", 0.175),
+                ("data/unsupported-tags.mp3", 0.312),
+                ("data/white_noise.mp3", 0.312),
+            ];
+
+            for (path_str, tolerance) in paths_and_tolerances {
+                let path = Path::new(path_str);
+                let symphonia_decoded = Decoder::decode(&path).unwrap();
+                let ffmpeg_decoded = crate::decoder::ffmpeg::FFmpeg::decode(&path).unwrap();
+
+                // calculate the similarity between the two arrays
+                let mut diff = 0.0;
+                for (a, b) in symphonia_decoded
+                    .sample_array
+                    .iter()
+                    .zip(ffmpeg_decoded.sample_array.iter())
+                {
+                    diff += (a - b).abs();
+                }
+                diff /= symphonia_decoded.sample_array.len() as f32;
+                assert!(
+                diff < tolerance,
+                "Difference between symphonia and ffmpeg: {diff}, tolerance: {tolerance}, file: {path_str}",
+            );
+            }
+        }
+
+        #[cfg(all(feature = "bench", feature = "symphonia-flac", test))]
+        mod bench {
+            extern crate test;
+            use crate::decoder::symphonia::PipelinedSymphoniaDecoder as Decoder;
+            use crate::decoder::Decoder as DecoderTrait;
+            use std::path::Path;
+            use test::Bencher;
+
+            #[bench]
+            /// No resampling, just decoding
+            fn bench_decode_mono(b: &mut Bencher) {
+                let path = Path::new("./data/s16_mono_22_5kHz.flac");
+                b.iter(|| {
+                    Decoder::decode(&path).unwrap();
+                });
+            }
+
+            #[bench]
+            /// needs to convert from stereo to mono
+            fn bench_decode_stereo(b: &mut Bencher) {
+                let path = Path::new("./data/s16_stereo_22_5kHz.flac");
+                b.iter(|| {
+                    Decoder::decode(&path).unwrap();
+                });
+            }
+
+            #[bench]
+            /// needs to convert from 44.1 kHz to 22.05 kHz
+            fn bench_resample_mono(b: &mut Bencher) {
+                let path = Path::new("./data/s32_mono_44_1_kHz.flac");
+                b.iter(|| {
+                    Decoder::decode(&path).unwrap();
+                });
+            }
+
+            #[bench]
+            /// needs to convert from 44.1 kHz to 22.05 kHz
+            /// and from stereo to mono
+            fn bench_resample_multi(b: &mut Bencher) {
+                let path = Path::new("./data/s32_stereo_44_1_kHz.flac");
+                b.iter(|| {
+                    Decoder::decode(&path).unwrap();
+                });
+            }
+
+            #[bench]
+            #[cfg(feature = "symphonia-mp3")]
+            fn bench_mp3(b: &mut Bencher) {
+                let path = Path::new("./data/s32_stereo_44_1_kHz.mp3");
+                b.iter(|| {
+                    Decoder::decode(&path).unwrap();
+                });
+            }
+
+            #[bench]
+            fn bench_long_song(b: &mut Bencher) {
+                let path = Path::new("./data/5_mins_of_noise_stereo_48kHz.ogg");
+                b.iter(|| {
+                    Decoder::decode(&path).unwrap();
+                });
+            }
         }
     }
 }

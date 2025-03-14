@@ -161,6 +161,7 @@ dependencies = [
  "ndarray-stats",
  "noisy_float",
  "pretty_assertions",
+ "rayon",
  "rcue",
  "rubato",
  "rusqlite",
@@ -1578,6 +1579,7 @@ dependencies = [
  "bytemuck",
  "lazy_static 1.5.0",
  "log",
+ "rustfft",
 ]
 
 [[package]]
